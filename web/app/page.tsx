@@ -1,123 +1,172 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
 
-type PhoneScore = { target: string; hyp: string; score: number };
-type EvalRes = {
-  avg: number;
-  targetIPA: string;
-  hypothesisIPA: string;
-  perPhone: PhoneScore[];
-  tip: string;
-};
+import React, { useState, useRef } from "react";
 
-type Coach = {
-  overallVerdict: "pass" | "retry";
-  oneSentenceTip: string;
-  bodyCue: string;
-  microDrill: string;
-  focusPhones: string[];
-  nextAttemptCriteria: { minAvg: number; noPhoneBelow: number };
-}
-
-const CARDS = [
-  { text: "bonjour", lang: "fr" },
-  { text: "rue", lang: "fr" },
-  { text: "thought", lang: "en" },
+const LANG_OPTIONS = [
+  { value: "en-us", label: "English (US)", flag: "🇺🇸" },
+  { value: "en-gb", label: "English (UK)", flag: "🇬🇧" },
+  { value: "fr-fr", label: "Français", flag: "🇫🇷" },
+  { value: "es", label: "Español", flag: "🇪🇸" },
+  { value: "de", label: "Deutsch", flag: "🇩🇪" },
+  { value: "it", label: "Italiano", flag: "🇮🇹" },
 ];
 
-export default function App() {
-  const [i, setI] = useState(0);
-  const [rec, setRec] = useState<MediaRecorder | null>(null);
-  const chunks = useRef<BlobPart[]>([]);
-  const [evalRes, setEvalRes] = useState<EvalRes | null>(null);
-  const [coach, setCoach] = useState<Coach | null>(null);
-  const busy = useRef(false);
+const PHONE_HELP: Record<string, { desc: string; example: string }> = {
+  θ: { desc: "Tongue lightly between teeth, blow air.", example: "think" },
+  ð: { desc: "Tongue between teeth, keep voicing.", example: "this" },
+  ʁ: { desc: "Uvular 'r'—tongue back near uvula.", example: "rue" },
+  y: { desc: "Rounded 'ee' sound—say 'ee' then round lips.", example: "lune" },
+  æ: { desc: "Open mouth wide, tongue front and low.", example: "cat" },
+};
 
-  useEffect(() => {
-    (async () => {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const r = new MediaRecorder(s, { mimeType: "audio/webm" });
-      r.ondataavailable = (e) => chunks.current.push(e.data);
-      r.onstop = async () => {
-        if (busy.current) return;
-        busy.current = true;
-        const blob = new Blob(chunks.current, { type: "audio/webm" });
-        chunks.current = [];
-        const fd = new FormData();
-        fd.append("audio", blob, "u.webm");
-        fd.append("text", CARDS[i].text);
-        fd.append("lang", CARDS[i].lang);
-        const r1 = await fetch("/api/eval", { method: "POST", body: fd });
-        const e1: EvalRes = await r1.json();
-        setEvalRes(e1);
+export default function AccentTrainerPage() {
+  const [lang, setLang] = useState("en-us");
+  const [targetText, setTargetText] = useState("hello");
+  const [recording, setRecording] = useState(false);
+  const [score, setScore] = useState<number | null>(null);
+  const [focusPhones, setFocusPhones] = useState<string[]>([]);
+  const [coachMessage, setCoachMessage] = useState<string>("");
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
 
-        const r2 = await fetch("/api/coach", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            word: CARDS[i].text,
-            lang: CARDS[i].lang,
-            targetIPA: e1.targetIPA,
-            hypothesisIPA: e1.hypothesisIPA,
-            perPhone: e1.perPhone
-          })
-        });
-        const c1: Coach = await r2.json();
-        setCoach(c1);
-        busy.current = false;
-      };
-      setRec(r);
-    })();
-  }, [i]);
-
-  const speak = () => {
-    const u = new SpeechSynthesisUtterance(CARDS[i].text);
-    u.lang = CARDS[i].lang === "fr" ? "fr-FR" : "en-US";
-    speechSynthesis.speak(u);
+  const playReference = () => {
+    const utter = new SpeechSynthesisUtterance(targetText);
+    utter.lang = lang;
+    speechSynthesis.speak(utter);
   };
 
-  const reset = () => { setEvalRes(null); setCoach(null); };
+  const playPhone = (phone: string) => {
+    const help = PHONE_HELP[phone];
+    if (help) {
+      const utter = new SpeechSynthesisUtterance(help.example);
+      utter.lang = lang;
+      speechSynthesis.speak(utter);
+    }
+  };
+
+  const startRecording = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mediaRecorder = new MediaRecorder(stream);
+    chunksRef.current = [];
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunksRef.current.push(e.data);
+    };
+    mediaRecorder.onstop = handleStop;
+    mediaRecorderRef.current = mediaRecorder;
+    mediaRecorder.start();
+    setRecording(true);
+  };
+
+  const stopRecording = () => {
+    mediaRecorderRef.current?.stop();
+    setRecording(false);
+  };
+
+  const handleStop = async () => {
+    const audioBlob = new Blob(chunksRef.current, { type: "audio/webm" });
+    const formData = new FormData();
+    formData.append("audio", audioBlob, "recording.webm");
+    formData.append("text", targetText);
+    formData.append("lang", lang);
+
+    const evalRes = await fetch("/api/eval", {
+      method: "POST",
+      body: formData,
+    });
+    const evalData = await evalRes.json();
+
+    setScore(evalData.avg);
+    const coachRes = await fetch("/api/coach", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ eval: evalData, targetText, lang }),
+    });
+    const coachData = await coachRes.json();
+
+    setFocusPhones(coachData.focusPhones || []);
+    setCoachMessage(coachData.coachMessage || "");
+  };
 
   return (
-    <main style={{maxWidth: 720, margin: "0 auto", padding: 24, fontFamily: "system-ui"}}>
-      <h1 style={{fontSize: 24, fontWeight: 600}}>Pronounce Cards</h1>
-      <div style={{border: "1px solid #e5e7eb", borderRadius: 12, padding: 16, marginTop: 12}}>
-        <div style={{fontSize: 36}}>{CARDS[i].text}</div>
-        <div style={{opacity: 0.6}}>{CARDS[i].lang.toUpperCase()}</div>
-        <div style={{display:"flex", gap: 8, marginTop: 12}}>
-          <button onClick={speak}>🔊 Play</button>
-          <button onClick={()=>{reset(); rec?.start();}}>⏺️ Record</button>
-          <button onClick={()=>rec?.stop()}>⏹️ Stop</button>
-          <button onClick={()=>{reset(); setI((k)=>(k+1)%CARDS.length);}}>Next ▶</button>
-        </div>
+    <div className="p-6 space-y-4">
+      <h1 className="text-2xl font-bold">Accent Trainer</h1>
 
-        {evalRes && (
-          <div style={{marginTop: 16}}>
-            <div>Avg score: <b>{Math.round(evalRes.avg*100)}</b>/100</div>
-            <div>Target: <code>{evalRes.targetIPA}</code></div>
-            <div>You said: <code>{evalRes.hypothesisIPA}</code></div>
-            <div>Tip: <span style={{color:"#b91c1c"}}>{evalRes.tip}</span></div>
-            <details style={{marginTop:8}}>
-              <summary>Per‑phone</summary>
-              <ul>
-                {evalRes.perPhone.map((p, idx)=>(
-                  <li key={idx}><code>{p.target}</code> ← <code>{p.hyp}</code> : {Math.round(p.score*100)}</li>
-                ))}
-              </ul>
-            </details>
-          </div>
-        )}
+      <div>
+        <label className="block mb-1">Language:</label>
+        <select
+          value={lang}
+          onChange={(e) => setLang(e.target.value)}
+          className="border p-1 rounded"
+        >
+          {LANG_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.flag} {opt.label}
+            </option>
+          ))}
+        </select>
+      </div>
 
-        {coach && (
-          <div style={{marginTop: 16, padding:12, border:"1px solid #e5e7eb", borderRadius:8}}>
-            <div><b>{coach.overallVerdict === "pass" ? "✅ Pass" : "🔁 Try again"}</b></div>
-            <div><b>Coach:</b> {coach.oneSentenceTip}</div>
-            <div><b>Body cue:</b> {coach.bodyCue}</div>
-            <div><b>Drill:</b> {coach.microDrill}</div>
-            {coach.focusPhones.length>0 && <div><b>Focus:</b> {coach.focusPhones.join(", ")}</div>}
-          </div>
+      <div>
+        <label className="block mb-1">Target Text:</label>
+        <input
+          className="border p-1 rounded"
+          value={targetText}
+          onChange={(e) => setTargetText(e.target.value)}
+        />
+        <button
+          className="ml-2 px-2 py-1 bg-blue-500 text-white rounded"
+          onClick={playReference}
+        >
+          ▶ Play Reference
+        </button>
+      </div>
+
+      <div>
+        {recording ? (
+          <button
+            onClick={stopRecording}
+            className="px-4 py-2 bg-red-500 text-white rounded"
+          >
+            ⏹ Stop
+          </button>
+        ) : (
+          <button
+            onClick={startRecording}
+            className="px-4 py-2 bg-green-500 text-white rounded"
+          >
+            🎙 Record
+          </button>
         )}
       </div>
-    </main>
+
+      {score !== null && (
+        <div className="mt-4">
+          <h2 className="text-lg font-semibold">
+            Score: {(score * 100).toFixed(1)}%
+          </h2>
+          {coachMessage && <p className="mt-2">{coachMessage}</p>}
+
+          {focusPhones.length > 0 && (
+            <div className="mt-3">
+              <h3 className="font-semibold">Focus Sounds:</h3>
+              <ul className="list-disc pl-5">
+                {focusPhones.map((p) => (
+                  <li key={p} className="mb-1">
+                    <span className="font-mono">{p}</span> —{" "}
+                    {PHONE_HELP[p]?.desc || "No description available"}
+                    <button
+                      className="ml-2 px-2 py-1 bg-gray-200 rounded"
+                      onClick={() => playPhone(p)}
+                    >
+                      🔊 Example
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

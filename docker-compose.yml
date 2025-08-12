@@ -1,0 +1,19 @@
+version: "3.9"
+services:
+  scorer:
+    build: ./scorer
+    ports: [ "8000:8000" ]
+    environment:
+      PYTHONUNBUFFERED: 1
+  web:
+    image: node:20
+    working_dir: /app
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      PRON_SERVER_URL: http://scorer:8000
+    volumes:
+      - ./web:/app
+    command: bash -lc "npm i && npm run dev"
+    ports: [ "3000:3000" ]
+    depends_on: [ scorer ]
