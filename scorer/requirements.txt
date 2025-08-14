@@ -1,11 +1,13 @@
-# requirements.txt
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-transformers>=4.42.0
-torch>=2.3.0
-phonemizer>=3.2.1
-librosa>=0.10.2.post1
-soundfile>=0.12.1
-numpy>=1.26.4
-scipy>=1.11.4
-python-multipart>=0.0.9
+# Core API framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Audio processing & ML
+torch
+torchaudio
+librosa
+openai-whisper
+
+# Basic utilities
+numpy

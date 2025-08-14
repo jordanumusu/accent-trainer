@@ -3,9 +3,8 @@
 import React, { useState, useRef } from "react";
 
 const LANG_OPTIONS = [
-  { value: "en-us", label: "English (US)", flag: "🇺🇸" },
-  { value: "en-gb", label: "English (UK)", flag: "🇬🇧" },
-  { value: "fr-fr", label: "Français", flag: "🇫🇷" },
+  { value: "en", label: "English (US)", flag: "🇺🇸" },
+  { value: "fr", label: "Français", flag: "🇫🇷" },
   { value: "es", label: "Español", flag: "🇪🇸" },
   { value: "de", label: "Deutsch", flag: "🇩🇪" },
   { value: "it", label: "Italiano", flag: "🇮🇹" },
@@ -20,7 +19,7 @@ const PHONE_HELP: Record<string, { desc: string; example: string }> = {
 };
 
 export default function AccentTrainerPage() {
-  const [lang, setLang] = useState("en-us");
+  const [lang, setLang] = useState("en");
   const [targetText, setTargetText] = useState("hello");
   const [recording, setRecording] = useState(false);
   const [score, setScore] = useState<number | null>(null);
@@ -75,7 +74,7 @@ export default function AccentTrainerPage() {
     });
     const evalData = await evalRes.json();
 
-    setScore(evalData.avg);
+    setScore(evalData.score);
     const coachRes = await fetch("/api/coach", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

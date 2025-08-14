@@ -1,20 +1,36 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg espeak-ng && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    espeak-ng \
+    libsndfile1 \
+    git \
+    && rm -rf /var/lib/apt/lists/*
 
+# Set working directory
 WORKDIR /app
+
+# Copy requirements first for better caching
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# cache model weights on build (optional)
-RUN python - <<'PY'
-from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-mid = "facebook/wav2vec2-xlsr-53-espeak-cv-ft"
-Wav2Vec2Processor.from_pretrained(mid)
-Wav2Vec2ForCTC.from_pretrained(mid)
-PY
+# Pre-download Whisper model to avoid first-request delay
+RUN python -c "import whisper; whisper.load_model('base')"
 
-COPY main.py .
+# Copy application code
+COPY . .
+
+# Create directories for data
+RUN mkdir -p /app/data/references /app/data/calibration
+
+# Expose port
 EXPOSE 8000
-CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000","--log-level","info"]
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run with uvicorn
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
