@@ -1,382 +1,341 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from pydantic import BaseModel
-import whisper
-import librosa
-import torch
-import numpy as np
-import base64
-import json
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass
-import logging
-import subprocess
+# main.py
+import io
 import tempfile
 import os
+import subprocess
+from typing import List, Optional
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.responses import JSONResponse
+import torch
+import torchaudio
+from espeakng import ESpeakNG
 
-from audio_io import decode_audio_bytes, b64_wav_from_tensor, validate_audio_length, TARGET_SR
+# Try to import soundfile as backup
+try:
+    import soundfile as sf
+    import numpy as np
+    SOUNDFILE_AVAILABLE = True
+except ImportError:
+    SOUNDFILE_AVAILABLE = False
 
-app = FastAPI()
+app = FastAPI(title="Accent Trainer – Wav2Vec2 (greedy) + eSpeak NG")
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+bundle = torchaudio.pipelines.WAV2VEC2_ASR_BASE_960H
+model = bundle.get_model().eval()
+labels: List[str] = bundle.get_labels()
+SAMPLE_RATE = bundle.sample_rate
 
-# Load models once at startup
-whisper_model = None
-reference_bank = {}  # word -> {"ipa": str, "audio": np.ndarray}
-calibration_stats = {}  # lang -> {"mean": float, "std": float}
+BLANK_TOKENS = {"<blank>", "<pad>", ""}
 
-@dataclass
-class PhoneScore:
-    phone: str
-    score: float
-    feedback: str
+esng = ESpeakNG()  
 
-@dataclass
-class ProsodyResult:
-    score: float
-    stress_ok: bool
-    timing_ratio: float
+# Map common ISO codes to eSpeak NG voices
+LANG_MAP = {
+    "en": "en-us",  # Default English to US
+    "en-us": "en-us",
+    "en-gb": "en-gb",
+    "fr": "fr-fr",
+    "es": "es-es",
+    "de": "de-de",
+    "pt": "pt-pt",
+    "pt-br": "pt-br",
+    "it": "it-it",
+    "nl": "nl-nl",
+}
 
-class PronunciationScorer:
-    def __init__(self):
-        self.simple_g2p = {
-            "en": {"hello": "həˈloʊ", "world": "wɜrld"},
-            "fr": {"bonjour": "bɔ̃ʒur", "merci": "mɛrsi"},
-            "es": {"hola": "ola", "gracias": "graθjas"}
-        }
-        
-        # Simple phone similarity lookup
-        self.phone_similarities = {
-            ("ɔ̃", "ɔ"): 0.7,  # nasal vs oral
-            ("ʁ", "r"): 0.8,   # uvular vs alveolar r
-            ("θ", "s"): 0.5,   # common L2 substitution
-            ("ð", "z"): 0.5,
-        }
+def map_lang(lang: str) -> str:
+    lang = (lang or "en-us").lower().strip()
+    # If exact match exists, use it
+    if lang in LANG_MAP:
+        return LANG_MAP[lang]
+    # Try base language (e.g., "en" from "en-us")
+    base_lang = lang.split('-')[0]
+    if base_lang in LANG_MAP:
+        return LANG_MAP[base_lang]
+    # Default to US English
+    return "en-us"
 
-    def text_to_ipa(self, text: str, lang: str) -> str:
-        """Convert text to IPA. Fallback to simple lookup for demo."""
-        text_clean = text.lower().strip()
-        
-        if lang in self.simple_g2p and text_clean in self.simple_g2p[lang]:
-            return self.simple_g2p[lang][text_clean]
-        
-        # In real implementation: use phonemizer/gruut
-        # For demo: return grapheme approximation
-        return text_clean
+# ----------------- Audio conversion with ffmpeg -----------------
+def convert_audio_to_wav(input_bytes: bytes, input_ext: str = '.webm') -> bytes:
+    """
+    Convert any audio format to WAV using ffmpeg
+    Returns WAV bytes
+    """
+    input_file = None
+    output_file = None
     
-    def asr_with_confidence(self, audio: torch.Tensor) -> Tuple[str, float]:
-        """Get ASR hypothesis and word-level confidence."""
-        try:
-            # Whisper accepts tensors directly
-            result = whisper_model.transcribe(
-                audio.float().cpu(), 
-                word_timestamps=True,
-                condition_on_previous_text=False
+    try:
+        # Create temp input file
+        with tempfile.NamedTemporaryFile(suffix=input_ext, delete=False) as input_file:
+            input_file.write(input_bytes)
+            input_path = input_file.name
+        
+        # Create temp output file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as output_file:
+            output_path = output_file.name
+        
+        # Convert using ffmpeg
+        # -i: input file
+        # -ar: sample rate (16000 is good for speech)
+        # -ac: audio channels (1 = mono)
+        # -f: format (wav)
+        # -y: overwrite output
+        cmd = [
+            'ffmpeg',
+            '-i', input_path,
+            '-ar', '16000',
+            '-ac', '1',
+            '-f', 'wav',
+            '-y',
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            raise Exception(f"ffmpeg failed: {result.stderr}")
+        
+        # Read the converted WAV
+        with open(output_path, 'rb') as f:
+            wav_bytes = f.read()
+        
+        return wav_bytes
+        
+    finally:
+        # Clean up temp files
+        for f in [input_path, output_path]:
+            if f and os.path.exists(f):
+                try:
+                    os.unlink(f)
+                except:
+                    pass
+
+# ----------------- Greedy CTC decode -----------------
+def greedy_decode(emissions: torch.Tensor) -> str:
+    """
+    emissions: (batch, time, num_labels)
+    returns: decoded string (spaces represented by '|' in labels -> real spaces)
+    """
+    # Take argmax over label dimension
+    indices = torch.argmax(emissions, dim=-1)[0].tolist()  # (time,)
+    prev_idx = None
+    out: List[str] = []
+    
+    for idx in indices:
+        # Skip if same as previous (collapse repeats)
+        if idx == prev_idx:
+            continue
+            
+        tok = labels[idx]
+        # Skip blank tokens
+        if tok not in BLANK_TOKENS:
+            out.append(tok)
+        
+        prev_idx = idx
+    
+    # Join and clean up
+    result = "".join(out)
+    # Replace pipe with space (W2V2 uses | for space)
+    result = result.replace("|", " ")
+    # Remove any stray dashes that aren't part of words
+    result = result.replace("-", "")
+    # Clean up whitespace
+    result = " ".join(result.split())
+    
+    return result.strip().lower()  # Lowercase for consistency
+
+# ----------------- Edit distance on IPA characters -----------------
+def levenshtein_chars(a: str, b: str) -> int:
+    # operate on character lists (strip spaces to avoid penalizing word spacing)
+    a_chars = [c for c in a if not c.isspace()]
+    b_chars = [c for c in b if not c.isspace()]
+    n, m = len(a_chars), len(b_chars)
+    if n == 0: return m
+    if m == 0: return n
+    dp = [list(range(m + 1))] + [[i] + [0]*m for i in range(1, n + 1)]
+    for i in range(1, n + 1):
+        ai = a_chars[i - 1]
+        row = dp[i]
+        prev_row = dp[i - 1]
+        for j in range(1, m + 1):
+            cost = 0 if ai == b_chars[j - 1] else 1
+            row[j] = min(
+                prev_row[j] + 1,      # deletion
+                row[j - 1] + 1,       # insertion
+                prev_row[j - 1] + cost  # substitution
             )
-            
-            if not result["segments"]:
-                return "", 0.0
-                
-            # Get first word and its confidence
-            words = result["segments"][0].get("words", [])
-            if not words:
-                return result["text"].strip(), 0.5  # fallback confidence
-                
-            text = words[0]["word"].strip()
-            confidence = words[0].get("probability", 0.5)
-            return text, confidence
-            
-        except Exception as e:
-            logging.error(f"ASR failed: {e}")
-            return "", 0.0
+    return dp[n][m]
 
-    def phone_similarity(self, target: str, hypothesis: str) -> float:
-        """Calculate similarity between two phones."""
-        if target == hypothesis:
-            return 1.0
-            
-        # Check similarity lookup
-        pair = (target, hypothesis)
-        if pair in self.phone_similarities:
-            return self.phone_similarities[pair]
-        if (hypothesis, target) in self.phone_similarities:
-            return self.phone_similarities[(hypothesis, target)]
-            
-        # Default mismatch penalty
-        return 0.3
-
-    def simple_ipa_align(self, target: str, hypothesis: str) -> List[Tuple[str, Optional[str]]]:
-        """Simple character-level alignment for IPA strings."""
-        # For demo: just pair up characters, pad with None if lengths differ
-        alignment = []
-        max_len = max(len(target), len(hypothesis))
-        
-        for i in range(max_len):
-            t_char = target[i] if i < len(target) else None
-            h_char = hypothesis[i] if i < len(hypothesis) else None
-            
-            if t_char:
-                alignment.append((t_char, h_char))
-                
-        return alignment
-
-    def score_phones(self, target_ipa: str, hypothesis_ipa: str, asr_confidence: float) -> List[PhoneScore]:
-        """Score individual phones."""
-        alignment = self.simple_ipa_align(target_ipa, hypothesis_ipa)
-        scores = []
-        
-        for target_phone, hyp_phone in alignment:
-            if not target_phone:
-                continue
-                
-            # Calculate phone score
-            edit_score = self.phone_similarity(target_phone, hyp_phone) if hyp_phone else 0.1
-            conf_score = asr_confidence  # Simplified: use word confidence for all phones
-            
-            phone_score = (edit_score ** 0.6) * (conf_score ** 0.4)
-            phone_score = max(0.0, min(1.0, phone_score))  # clamp to [0,1]
-            
-            # Generate feedback
-            feedback = "good" if phone_score > 0.8 else "needs work"
-            if hyp_phone and target_phone != hyp_phone:
-                feedback = f"pronounced as /{hyp_phone}/"
-                
-            scores.append(PhoneScore(
-                phone=target_phone,
-                score=round(phone_score, 2),
-                feedback=feedback
-            ))
-            
-        return scores
-
-    def extract_basic_prosody(self, audio: torch.Tensor, sr: int = TARGET_SR) -> Dict:
-        """Extract basic prosodic features."""
-        # Convert to numpy only for librosa
-        audio_np = audio.float().cpu().numpy()
-        
-        # Fundamental frequency
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            audio_np, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7')
-        )
-        
-        # Energy/RMS
-        rms = librosa.feature.rms(y=audio_np)[0]
-        
-        # Duration
-        duration = audio.numel() / sr
-        
-        return {
-            "f0_mean": float(np.nanmean(f0)) if not np.all(np.isnan(f0)) else 0.0,
-            "energy_mean": float(np.mean(rms)),
-            "duration": duration
-        }
-
-    def compare_prosody(self, user_features: Dict, ref_features: Dict) -> ProsodyResult:
-        """Compare user prosody to reference."""
-        # Duration ratio
-        timing_ratio = user_features["duration"] / max(ref_features["duration"], 0.1)
-        dur_score = np.exp(-abs(np.log(timing_ratio))) if timing_ratio > 0 else 0.0
-        
-        # F0 similarity (simplified)
-        f0_diff = abs(user_features["f0_mean"] - ref_features["f0_mean"])
-        f0_score = max(0.0, 1.0 - f0_diff / 100.0)  # normalize by 100Hz
-        
-        # Energy similarity
-        energy_diff = abs(user_features["energy_mean"] - ref_features["energy_mean"])
-        energy_score = max(0.0, 1.0 - energy_diff / 0.1)
-        
-        # Combined prosody score
-        prosody_score = 0.5 * dur_score + 0.3 * f0_score + 0.2 * energy_score
-        
-        return ProsodyResult(
-            score=round(prosody_score, 2),
-            stress_ok=0.8 <= timing_ratio <= 1.2,  # simplified stress check
-            timing_ratio=round(timing_ratio, 2)
-        )
-
-    def calibrate_score(self, raw_score: float, lang: str) -> float:
-        """Apply calibration based on collected data."""
-        if lang not in calibration_stats:
-            return raw_score  # no calibration data
-            
-        stats = calibration_stats[lang]
-        z_score = (raw_score - stats["mean"]) / max(stats["std"], 0.1)
-        
-        # Sigmoid to [0,1]
-        return 1.0 / (1.0 + np.exp(-z_score))
-
-    def generate_tip(self, phone_scores: List[PhoneScore], prosody: ProsodyResult) -> str:
-        """Generate a helpful tip based on scores."""
-        # Find lowest scoring phone
-        worst_phone = min(phone_scores, key=lambda p: p.score) if phone_scores else None
-        
-        if prosody.timing_ratio < 0.8:
-            return "Try speaking more slowly and clearly."
-        elif prosody.timing_ratio > 1.2:
-            return "Try to maintain a steadier pace."
-        elif worst_phone and worst_phone.score < 0.6:
-            return f"Focus on the /{worst_phone.phone}/ sound - {worst_phone.feedback}."
-        else:
-            return "Good pronunciation! Keep practicing."
-
-# Create scorer instance at module level
-scorer = PronunciationScorer()
-
-def generate_espeak_reference(text: str, lang: str) -> torch.Tensor:
-    """
-    Generate reference audio using espeak-ng and return as mono float32 tensor.
-    """
-    voice_map = {
-        "en": "en-us",    # American English
-        "fr": "fr",       # French  
-        "es": "es",       # Spanish
-        "de": "de",       # German (for future)
-    }
-    voice = voice_map.get(lang, "en")
-    
-    with tempfile.NamedTemporaryFile(suffix='.wav') as tmp:  # delete=True by default
-        try:
-            subprocess.run([
-                'espeak-ng',
-                f'-v{voice}',
-                '-s', '120',         # slower for clarity
-                '-a', '200',         # amplitude
-                '-w', tmp.name,      # write output wav to temp file
-                text
-            ], check=True)  # removed capture_output since we don't use it
-            
-            # Read before file is deleted
-            tmp.seek(0)
-            with open(tmp.name, 'rb') as f:
-                return decode_audio_bytes(f.read(), sr=TARGET_SR)
-                
-        except FileNotFoundError:
-            logging.error("espeak-ng not found. Please install espeak-ng.")
-            return torch.zeros(TARGET_SR)
-        except subprocess.CalledProcessError as e:
-            logging.warning(f"espeak-ng failed for '{text}': {e}")
-            return torch.zeros(TARGET_SR)
-
-@app.on_event("startup")
-async def startup_event():
-    global whisper_model, reference_bank, calibration_stats
-    
-    # Load Whisper model
-    whisper_model = whisper.load_model("base")
-    
-    # Demo words with target IPA
-    demo_words = {
-        ("hello", "en"): "həˈloʊ",
-        ("world", "en"): "wɜrld", 
-        ("test", "en"): "tɛst",
-        ("bonjour", "fr"): "bɔ̃ʒur",
-        ("merci", "fr"): "mɛrsi",
-        ("hola", "es"): "ola",
-        ("gracias", "es"): "graθjas"
-    }
-    
-    # Generate reference audio bank
-    reference_bank = {}
-    for (word, lang), ipa in demo_words.items():
-        reference_bank[(word, lang)] = {
-            "ipa": ipa,
-            "waveform": generate_espeak_reference(word, lang)
-        }
-        logging.info(f"Generated reference for '{word}' in {lang}")
-    
-    # Load calibration stats
-    calibration_stats = {
-        "en": {"mean": 0.6, "std": 0.2},
-        "fr": {"mean": 0.55, "std": 0.25},
-        "es": {"mean": 0.58, "std": 0.22}
-    }
-
+# ----------------- /eval endpoint -----------------
 @app.post("/eval")
-async def score_pronunciation(
+async def eval_pronunciation(
     audio: UploadFile = File(...),
     text: str = Form(...),
-    lang: str = Form(...),
-    verbose: bool = Form(False)
+    lang: str = Form("en-us"),
 ):
+    # Read upload
+    audio_bytes = await audio.read()
+    
+    # Get file extension from filename
+    ext = '.webm'  # Default to webm
+    if audio.filename:
+        file_ext = os.path.splitext(audio.filename)[1].lower()
+        if file_ext:
+            ext = file_ext
+    
+    # Convert to WAV if not already WAV
+    if ext != '.wav':
+        try:
+            wav_bytes = convert_audio_to_wav(audio_bytes, ext)
+        except Exception as e:
+            return JSONResponse(
+                {"error": f"Failed to convert audio from {ext} to WAV: {e}. Make sure ffmpeg is installed."},
+                status_code=400
+            )
+    else:
+        wav_bytes = audio_bytes
+    
+    # Load the WAV audio - try multiple approaches
+    temp_wav = None
     try:
-        # Normalize and validate inputs
-        text = text.lower().strip()
-        lang = lang.lower().strip()
+        # First write to temp file
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+            temp_wav.write(wav_bytes)
+            temp_wav_path = temp_wav.name
         
-        # Validate language support
-        supported_langs = {"en", "fr", "es"}
-        if lang not in supported_langs:
-            raise HTTPException(400, f"Language '{lang}' not supported. Use: {', '.join(supported_langs)}")
-        
-        logging.info(f"Uploaded: filename={audio.filename!r} content_type={audio.content_type!r}")
-
-        # Load and validate audio using clean audio_io
-        audio_bytes = await audio.read()
-        waveform = decode_audio_bytes(audio_bytes, sr=TARGET_SR)
-        validate_audio_length(waveform)
-        
-        # Check if we have reference for this word
-        ref_key = (text, lang)
-        if ref_key not in reference_bank:
-            available_words = [word for word, l in reference_bank.keys() if l == lang]
-            raise HTTPException(400, f"Word '{text}' not available in {lang}. Try: {', '.join(available_words)}")
-        
-        reference = reference_bank[ref_key]
-        ref_waveform = reference["waveform"]
-        
-        # Get target IPA
-        target_ipa = scorer.text_to_ipa(text, lang)
-        
-        # ASR + confidence (pass tensor, convert inside method)
-        asr_text, asr_confidence = scorer.asr_with_confidence(waveform)
-        hypothesis_ipa = scorer.text_to_ipa(asr_text, lang)
-        
-        # Score phones
-        phone_scores = scorer.score_phones(target_ipa, hypothesis_ipa, asr_confidence)
-        
-        # Prosody analysis (pass tensor, convert inside method)
-        user_prosody = scorer.extract_basic_prosody(waveform, sr=TARGET_SR)
-        ref_prosody = scorer.extract_basic_prosody(ref_waveform, sr=TARGET_SR)
-        prosody_result = scorer.compare_prosody(user_prosody, ref_prosody)
-        
-        # Overall score
-        segment_score = float(torch.tensor([p.score for p in phone_scores]).mean()) if phone_scores else 0.0
-        raw_overall = 0.95 * segment_score + 0.05 * prosody_result.score # prosody with TTS is not great
-        overall_score = scorer.calibrate_score(raw_overall, lang)
-        
-        # Generate response
-        response = {
-            "score": round(overall_score, 2),
-            "targetIPA": target_ipa,
-            "hypothesisIPA": hypothesis_ipa,
-            "phones": [{"p": p.phone, "score": p.score, "feedback": p.feedback} for p in phone_scores],
-            "prosody": {
-                "score": prosody_result.score,
-                "stress_ok": prosody_result.stress_ok,
-                "timing_ratio": prosody_result.timing_ratio
-            },
-            "tip": scorer.generate_tip(phone_scores, prosody_result),
-            "playback": {
-                "user": b64_wav_from_tensor(waveform, TARGET_SR),
-                "reference": b64_wav_from_tensor(ref_waveform, TARGET_SR)
-            }
-        }
-        
-        if verbose:
-            response["debug"] = {
-                "asr_text": asr_text,
-                "asr_confidence": asr_confidence,
-                "user_prosody": user_prosody,
-                "ref_prosody": ref_prosody
-            }
-        
-        return response
-        
+        # Try loading with explicit backend
+        try:
+            # Try with soundfile backend (most reliable for WAV)
+            waveform, sr = torchaudio.load(temp_wav_path, backend="soundfile")
+        except:
+            try:
+                # Fallback to sox backend
+                waveform, sr = torchaudio.load(temp_wav_path, backend="sox_io")
+            except:
+                # Last resort - try without specifying backend but with format
+                waveform, sr = torchaudio.load(temp_wav_path, format="wav")
+                
     except Exception as e:
-        logging.error(f"Error processing request: {e}")
-        raise HTTPException(500, "Internal server error")
+        # If torchaudio completely fails, try using scipy/soundfile directly
+        try:
+            import soundfile as sf
+            import numpy as np
+            
+            waveform_np, sr = sf.read(io.BytesIO(wav_bytes))
+            # Convert to torch tensor and add batch dimension if needed
+            waveform = torch.from_numpy(waveform_np).float()
+            if waveform.dim() == 1:
+                waveform = waveform.unsqueeze(0)
+            elif waveform.dim() == 2 and waveform.shape[1] > waveform.shape[0]:
+                waveform = waveform.transpose(0, 1)
+        except Exception as sf_error:
+            return JSONResponse(
+                {"error": f"Failed to load audio with any method. torchaudio: {e}, soundfile: {sf_error}. Check if soundfile is installed: pip install soundfile"},
+                status_code=400
+            )
+    finally:
+        if temp_wav and os.path.exists(temp_wav_path):
+            try:
+                os.unlink(temp_wav_path)
+            except:
+                pass
 
+    # Mono + resample to model rate
+    if waveform.size(0) > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sr != SAMPLE_RATE:
+        waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
+
+    # ASR → greedy CTC
+    with torch.inference_mode():
+        emissions, _ = model(waveform)  # (1, T, num_labels)
+    hypothesis = greedy_decode(emissions)
+
+    # eSpeak NG: target + hypothesis to IPA
+    voice = map_lang(lang)
+    
+    # Process target text to IPA
+    try:
+        # Set the voice first
+        esng.voice = voice
+        # Clean the target text
+        clean_text = text.strip()
+        if clean_text:
+            # g2p() with ipa=2 returns IPA transcription
+            target_ipa = esng.g2p(clean_text, ipa=2)
+            # Clean up IPA output
+            target_ipa = target_ipa.strip()
+    except Exception as e:
+        # Try with default US English voice
+        try:
+            esng.voice = "en-us"
+            target_ipa = esng.g2p(clean_text, ipa=2)
+            target_ipa = target_ipa.strip()
+        except Exception as last_e:
+            target_ipa = f"[IPA conversion failed: {str(e)[:50]}]"
+
+    # Process hypothesis to IPA
+    if hypothesis and hypothesis.strip():
+        # Clean hypothesis - remove any leading dashes or special chars
+        clean_hypothesis = hypothesis.strip()
+        # Remove any stray dashes or special characters that might confuse espeak
+        clean_hypothesis = ''.join(c for c in clean_hypothesis if c.isalnum() or c.isspace())
+        clean_hypothesis = ' '.join(clean_hypothesis.split())  # normalize whitespace
+        
+        if clean_hypothesis:
+            try:
+                esng.voice = voice
+                hyp_ipa = esng.g2p(clean_hypothesis, ipa=2)
+                hyp_ipa = hyp_ipa.strip()
+            except:
+                try:
+                    esng.voice = "en-us"
+                    hyp_ipa = esng.g2p(clean_hypothesis, ipa=2)
+                    hyp_ipa = hyp_ipa.strip()
+                except:
+                    hyp_ipa = ""
+        else:
+            hyp_ipa = ""
+    else:
+        hyp_ipa = ""
+
+    # Score over IPA characters (space-insensitive)
+    dist = levenshtein_chars(target_ipa, hyp_ipa)
+    tgt_len = max(len([c for c in target_ipa if not c.isspace()]), 1)
+    score = max(0.0, 1.0 - dist / tgt_len)
+
+    return JSONResponse({
+        "target": text,
+        "hypothesis": hypothesis,
+        "target_ipa": target_ipa,
+        "hypothesis_ipa": hyp_ipa,
+        "score": round(score, 4),
+        "meta": {
+            "sr_in": sr,
+            "sr_model": SAMPLE_RATE,
+            "decoder": "greedy_ctc",
+            "ipa_scoring": "levenshtein_char_space_insensitive",
+            "audio_format": ext
+        }
+    })
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    # Check if ffmpeg is available
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        ffmpeg_available = result.returncode == 0
+    except:
+        ffmpeg_available = False
+    
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "ffmpeg_available": ffmpeg_available
+    }
+
+# To run locally:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

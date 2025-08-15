@@ -5,9 +5,10 @@ python-multipart
 
 # Audio processing & ML
 torch
+torchcodec
 torchaudio
-librosa
-openai-whisper
+py-espeak-ng
+soundfile
 
 # Basic utilities
 numpy

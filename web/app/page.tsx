@@ -10,18 +10,52 @@ const LANG_OPTIONS = [
   { value: "it", label: "Italiano", flag: "🇮🇹" },
 ];
 
-const PHONE_HELP: Record<string, { desc: string; example: string }> = {
-  θ: { desc: "Tongue lightly between teeth, blow air.", example: "think" },
-  ð: { desc: "Tongue between teeth, keep voicing.", example: "this" },
-  ʁ: { desc: "Uvular 'r'—tongue back near uvula.", example: "rue" },
-  y: { desc: "Rounded 'ee' sound—say 'ee' then round lips.", example: "lune" },
-  æ: { desc: "Open mouth wide, tongue front and low.", example: "cat" },
+// Hacky and needs to be replaced
+const PHONE_HELP: Record<string, { desc: string; examples: Record<string, string> }> = {
+  θ: { desc: "Tongue lightly between teeth, blow air.", examples: { en: "think", fr: "think", es: "think" } },
+  ð: { desc: "Tongue between teeth, keep voicing.", examples: { en: "this", fr: "this", es: "this" } },
+  ʁ: { desc: "Uvular 'r'—tongue back near uvula.", examples: { en: "red", fr: "rue", es: "rojo" } },
+  y: { desc: "Rounded 'ee' sound—say 'ee' then round lips.", examples: { en: "you", fr: "lune", es: "tú" } },
+  æ: { desc: "Open mouth wide, tongue front and low.", examples: { en: "cat", fr: "cat", es: "gato" } },
+  ɛ: { desc: "Open 'e' sound.", examples: { en: "bed", fr: "père", es: "perro" } },
+  ɪ: { desc: "Short 'i' sound.", examples: { en: "bit", fr: "si", es: "ir" } },
+  ɑ: { desc: "Open 'a' sound.", examples: { en: "father", fr: "pâte", es: "casa" } },
+  ɔ: { desc: "Open 'o' sound.", examples: { en: "thought", fr: "port", es: "ojo" } },
+  ʊ: { desc: "Short 'u' sound.", examples: { en: "book", fr: "vous", es: "luz" } },
+  ə: { desc: "Neutral vowel sound.", examples: { en: "about", fr: "le", es: "casa" } },
+  ʌ: { desc: "Open-mid back vowel.", examples: { en: "but", fr: "peu", es: "amor" } },
+  ɒ: { desc: "Rounded open back vowel.", examples: { en: "lot", fr: "comme", es: "oro" } },
+  ɜ: { desc: "Open-mid central vowel.", examples: { en: "bird", fr: "peur", es: "ser" } },
+  r: { desc: "Alveolar trill.", examples: { en: "red", fr: "rouge", es: "rojo" } },
+  ɹ: { desc: "Approximant 'r'.", examples: { en: "run", fr: "red", es: "red" } },
+  l: { desc: "Lateral approximant.", examples: { en: "love", fr: "lune", es: "luz" } },
+  w: { desc: "Labio-velar approximant.", examples: { en: "water", fr: "oui", es: "huevo" } },
+  j: { desc: "Palatal approximant.", examples: { en: "yes", fr: "yeux", es: "yo" } },
+  h: { desc: "Voiceless glottal fricative.", examples: { en: "hello", fr: "hello", es: "jota" } },
+  f: { desc: "Voiceless labiodental fricative.", examples: { en: "fish", fr: "feu", es: "feo" } },
+  v: { desc: "Voiced labiodental fricative.", examples: { en: "voice", fr: "vous", es: "vino" } },
+  s: { desc: "Voiceless alveolar fricative.", examples: { en: "sun", fr: "soir", es: "sol" } },
+  z: { desc: "Voiced alveolar fricative.", examples: { en: "zoo", fr: "rose", es: "mismo" } },
+  ʃ: { desc: "Voiceless postalveolar fricative.", examples: { en: "ship", fr: "chien", es: "show" } },
+  ʒ: { desc: "Voiced postalveolar fricative.", examples: { en: "measure", fr: "je", es: "beige" } },
+  tʃ: { desc: "Voiceless postalveolar affricate.", examples: { en: "church", fr: "match", es: "mucho" } },
+  dʒ: { desc: "Voiced postalveolar affricate.", examples: { en: "judge", fr: "juge", es: "general" } },
+  p: { desc: "Voiceless bilabial plosive.", examples: { en: "pen", fr: "papa", es: "papa" } },
+  b: { desc: "Voiced bilabial plosive.", examples: { en: "ball", fr: "beau", es: "bien" } },
+  t: { desc: "Voiceless alveolar plosive.", examples: { en: "top", fr: "tout", es: "todo" } },
+  d: { desc: "Voiced alveolar plosive.", examples: { en: "dog", fr: "deux", es: "dos" } },
+  k: { desc: "Voiceless velar plosive.", examples: { en: "cat", fr: "car", es: "casa" } },
+  g: { desc: "Voiced velar plosive.", examples: { en: "go", fr: "gare", es: "gato" } },
+  m: { desc: "Bilabial nasal.", examples: { en: "man", fr: "mère", es: "mama" } },
+  n: { desc: "Alveolar nasal.", examples: { en: "no", fr: "nous", es: "no" } },
+  ŋ: { desc: "Velar nasal.", examples: { en: "sing", fr: "parking", es: "mango" } },
 };
 
-export default function AccentTrainerPage() {
+export default function Page() {
   const [lang, setLang] = useState("en");
   const [targetText, setTargetText] = useState("hello");
   const [recording, setRecording] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [score, setScore] = useState<number | null>(null);
   const [focusPhones, setFocusPhones] = useState<string[]>([]);
   const [coachMessage, setCoachMessage] = useState<string>("");
@@ -35,10 +69,19 @@ export default function AccentTrainerPage() {
   };
 
   const playPhone = (phone: string) => {
+    console.log("Playing phone:", phone, "Available in PHONE_HELP:", !!PHONE_HELP[phone]);
     const help = PHONE_HELP[phone];
     if (help) {
-      const utter = new SpeechSynthesisUtterance(help.example);
-      utter.lang = lang;
+      const example = help.examples[lang] || help.examples["en"];
+      const utter = new SpeechSynthesisUtterance(example);
+      const speechLang = lang === "en" ? "en-US" : lang === "fr" ? "fr-FR" : lang === "es" ? "es-ES" : "en-US";
+      utter.lang = speechLang;
+      speechSynthesis.speak(utter);
+    } else {
+      console.log("No example found for phone:", phone);
+      const utter = new SpeechSynthesisUtterance(phone);
+      const speechLang = lang === "en" ? "en-US" : lang === "fr" ? "fr-FR" : lang === "es" ? "es-ES" : "en-US";
+      utter.lang = speechLang;
       speechSynthesis.speak(utter);
     }
   };
@@ -62,7 +105,8 @@ export default function AccentTrainerPage() {
   };
 
   const handleStop = async () => {
-    const audioBlob = new Blob(chunksRef.current, { type: "audio/webm" });
+    setLoading(true);
+    const audioBlob = new Blob(chunksRef.current, { type: "audio/wav" });
     const formData = new FormData();
     formData.append("audio", audioBlob, "recording.webm");
     formData.append("text", targetText);
@@ -78,12 +122,13 @@ export default function AccentTrainerPage() {
     const coachRes = await fetch("/api/coach", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ eval: evalData, targetText, lang }),
+      body: JSON.stringify({ ...evalData, targetText, lang }),
     });
     const coachData = await coachRes.json();
 
     setFocusPhones(coachData.focusPhones || []);
-    setCoachMessage(coachData.coachMessage || "");
+    setCoachMessage(coachData.message || "");
+    setLoading(false);
   };
 
   return (
@@ -128,6 +173,13 @@ export default function AccentTrainerPage() {
           >
             ⏹ Stop
           </button>
+        ) : loading ? (
+          <button
+            disabled
+            className="px-4 py-2 bg-gray-400 text-white rounded cursor-not-allowed"
+          >
+            Processing...
+          </button>
         ) : (
           <button
             onClick={startRecording}
@@ -154,7 +206,7 @@ export default function AccentTrainerPage() {
                     <span className="font-mono">{p}</span> —{" "}
                     {PHONE_HELP[p]?.desc || "No description available"}
                     <button
-                      className="ml-2 px-2 py-1 bg-gray-200 rounded"
+                      className="ml-2 px-2 py-1 bg-gray-200 dark:bg-gray-600 text-black dark:text-white rounded"
                       onClick={() => playPhone(p)}
                     >
                       🔊 Example
