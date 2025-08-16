@@ -118,7 +118,6 @@ export default function Page() {
     });
     const evalData = await evalRes.json();
 
-    setScore(evalData.score);
     const coachRes = await fetch("/api/coach", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -126,6 +125,7 @@ export default function Page() {
     });
     const coachData = await coachRes.json();
 
+    setScore(coachData.score);
     setFocusPhones(coachData.focusPhones || []);
     setCoachMessage(coachData.message || "");
     setLoading(false);
@@ -133,7 +133,7 @@ export default function Page() {
 
   return (
     <div className="p-6 space-y-4">
-      <h1 className="text-2xl font-bold">Accent Trainer</h1>
+      <h1 className="text-2xl font-bold">Speech Trainer</h1>
 
       <div>
         <label className="block mb-1">Language:</label>
@@ -204,7 +204,6 @@ export default function Page() {
                 {focusPhones.map((p) => (
                   <li key={p} className="mb-1">
                     <span className="font-mono">{p}</span> —{" "}
-                    {PHONE_HELP[p]?.desc || "No description available"}
                     <button
                       className="ml-2 px-2 py-1 bg-gray-200 dark:bg-gray-600 text-black dark:text-white rounded"
                       onClick={() => playPhone(p)}

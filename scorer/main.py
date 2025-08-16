@@ -44,15 +44,12 @@ LANG_MAP = {
 }
 
 def map_lang(lang: str) -> str:
-    lang = (lang or "en-us").lower().strip()
     # If exact match exists, use it
     if lang in LANG_MAP:
         return LANG_MAP[lang]
-    # Try base language (e.g., "en" from "en-us")
     base_lang = lang.split('-')[0]
     if base_lang in LANG_MAP:
         return LANG_MAP[base_lang]
-    # Default to US English
     return "en-us"
 
 # ----------------- Audio conversion with ffmpeg -----------------
@@ -65,12 +62,10 @@ def convert_audio_to_wav(input_bytes: bytes, input_ext: str = '.webm') -> bytes:
     output_file = None
     
     try:
-        # Create temp input file
         with tempfile.NamedTemporaryFile(suffix=input_ext, delete=False) as input_file:
             input_file.write(input_bytes)
             input_path = input_file.name
         
-        # Create temp output file
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as output_file:
             output_path = output_file.name
         
@@ -95,14 +90,12 @@ def convert_audio_to_wav(input_bytes: bytes, input_ext: str = '.webm') -> bytes:
         if result.returncode != 0:
             raise Exception(f"ffmpeg failed: {result.stderr}")
         
-        # Read the converted WAV
         with open(output_path, 'rb') as f:
             wav_bytes = f.read()
         
         return wav_bytes
         
     finally:
-        # Clean up temp files
         for f in [input_path, output_path]:
             if f and os.path.exists(f):
                 try:
@@ -133,38 +126,13 @@ def greedy_decode(emissions: torch.Tensor) -> str:
         
         prev_idx = idx
     
-    # Join and clean up
     result = "".join(out)
-    # Replace pipe with space (W2V2 uses | for space)
     result = result.replace("|", " ")
-    # Remove any stray dashes that aren't part of words
     result = result.replace("-", "")
-    # Clean up whitespace
     result = " ".join(result.split())
     
     return result.strip().lower()  # Lowercase for consistency
 
-# ----------------- Edit distance on IPA characters -----------------
-def levenshtein_chars(a: str, b: str) -> int:
-    # operate on character lists (strip spaces to avoid penalizing word spacing)
-    a_chars = [c for c in a if not c.isspace()]
-    b_chars = [c for c in b if not c.isspace()]
-    n, m = len(a_chars), len(b_chars)
-    if n == 0: return m
-    if m == 0: return n
-    dp = [list(range(m + 1))] + [[i] + [0]*m for i in range(1, n + 1)]
-    for i in range(1, n + 1):
-        ai = a_chars[i - 1]
-        row = dp[i]
-        prev_row = dp[i - 1]
-        for j in range(1, m + 1):
-            cost = 0 if ai == b_chars[j - 1] else 1
-            row[j] = min(
-                prev_row[j] + 1,      # deletion
-                row[j - 1] + 1,       # insertion
-                prev_row[j - 1] + cost  # substitution
-            )
-    return dp[n][m]
 
 # ----------------- /eval endpoint -----------------
 @app.post("/eval")
@@ -173,17 +141,14 @@ async def eval_pronunciation(
     text: str = Form(...),
     lang: str = Form("en-us"),
 ):
-    # Read upload
     audio_bytes = await audio.read()
     
-    # Get file extension from filename
     ext = '.webm'  # Default to webm
     if audio.filename:
         file_ext = os.path.splitext(audio.filename)[1].lower()
         if file_ext:
             ext = file_ext
     
-    # Convert to WAV if not already WAV
     if ext != '.wav':
         try:
             wav_bytes = convert_audio_to_wav(audio_bytes, ext)
@@ -195,34 +160,26 @@ async def eval_pronunciation(
     else:
         wav_bytes = audio_bytes
     
-    # Load the WAV audio - try multiple approaches
     temp_wav = None
     try:
-        # First write to temp file
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
             temp_wav.write(wav_bytes)
             temp_wav_path = temp_wav.name
         
-        # Try loading with explicit backend
         try:
-            # Try with soundfile backend (most reliable for WAV)
             waveform, sr = torchaudio.load(temp_wav_path, backend="soundfile")
         except:
             try:
-                # Fallback to sox backend
                 waveform, sr = torchaudio.load(temp_wav_path, backend="sox_io")
             except:
-                # Last resort - try without specifying backend but with format
                 waveform, sr = torchaudio.load(temp_wav_path, format="wav")
                 
     except Exception as e:
-        # If torchaudio completely fails, try using scipy/soundfile directly
         try:
             import soundfile as sf
             import numpy as np
             
             waveform_np, sr = sf.read(io.BytesIO(wav_bytes))
-            # Convert to torch tensor and add batch dimension if needed
             waveform = torch.from_numpy(waveform_np).float()
             if waveform.dim() == 1:
                 waveform = waveform.unsqueeze(0)
@@ -240,33 +197,24 @@ async def eval_pronunciation(
             except:
                 pass
 
-    # Mono + resample to model rate
     if waveform.size(0) > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     if sr != SAMPLE_RATE:
         waveform = torchaudio.functional.resample(waveform, sr, SAMPLE_RATE)
 
-    # ASR → greedy CTC
     with torch.inference_mode():
-        emissions, _ = model(waveform)  # (1, T, num_labels)
+        emissions, _ = model(waveform)  
     hypothesis = greedy_decode(emissions)
 
-    # eSpeak NG: target + hypothesis to IPA
     voice = map_lang(lang)
     
-    # Process target text to IPA
     try:
-        # Set the voice first
         esng.voice = voice
-        # Clean the target text
         clean_text = text.strip()
         if clean_text:
-            # g2p() with ipa=2 returns IPA transcription
             target_ipa = esng.g2p(clean_text, ipa=2)
-            # Clean up IPA output
             target_ipa = target_ipa.strip()
     except Exception as e:
-        # Try with default US English voice
         try:
             esng.voice = "en-us"
             target_ipa = esng.g2p(clean_text, ipa=2)
@@ -274,11 +222,8 @@ async def eval_pronunciation(
         except Exception as last_e:
             target_ipa = f"[IPA conversion failed: {str(e)[:50]}]"
 
-    # Process hypothesis to IPA
     if hypothesis and hypothesis.strip():
-        # Clean hypothesis - remove any leading dashes or special chars
         clean_hypothesis = hypothesis.strip()
-        # Remove any stray dashes or special characters that might confuse espeak
         clean_hypothesis = ''.join(c for c in clean_hypothesis if c.isalnum() or c.isspace())
         clean_hypothesis = ' '.join(clean_hypothesis.split())  # normalize whitespace
         
@@ -299,22 +244,15 @@ async def eval_pronunciation(
     else:
         hyp_ipa = ""
 
-    # Score over IPA characters (space-insensitive)
-    dist = levenshtein_chars(target_ipa, hyp_ipa)
-    tgt_len = max(len([c for c in target_ipa if not c.isspace()]), 1)
-    score = max(0.0, 1.0 - dist / tgt_len)
-
     return JSONResponse({
         "target": text,
         "hypothesis": hypothesis,
         "target_ipa": target_ipa,
         "hypothesis_ipa": hyp_ipa,
-        "score": round(score, 4),
         "meta": {
             "sr_in": sr,
             "sr_model": SAMPLE_RATE,
             "decoder": "greedy_ctc",
-            "ipa_scoring": "levenshtein_char_space_insensitive",
             "audio_format": ext
         }
     })
@@ -322,7 +260,6 @@ async def eval_pronunciation(
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    # Check if ffmpeg is available
     try:
         result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
         ffmpeg_available = result.returncode == 0
@@ -335,7 +272,6 @@ async def health_check():
         "ffmpeg_available": ffmpeg_available
     }
 
-# To run locally:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

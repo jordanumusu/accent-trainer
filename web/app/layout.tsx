@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Accent Trainer",
-  description: "Pronunciation training with Whisper speech analysis",
+  title: "Speech Trainer",
+  description: "Pronunciation trainings",
 };
 
 export default function RootLayout({
